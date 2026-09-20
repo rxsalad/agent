@@ -1,179 +1,283 @@
 # Qwen Exploration
 
-Qwen3.6-27B 是阿里云Qwen系列开源的一个 27B 参数**稠密（dense）**多模态模型，具备原生的视觉语言理解能力（图像、视频与文本联合输入）。
+Qwen3.6-27B is a 27B-parameter **dense** multimodal model open-sourced by Alibaba Cloud's Qwen series, with native vision-language understanding capabilities (joint image, video, and text input).
 
-它是一个统一 checkpoint 中同时内置 reasoning 能力的模型：通过在推理请求中显式设置参数（如聊天模板中的 `enable_thinking` 或类似的 `thinking` 布尔字段）来切换 **Thinking Mode** 与 **Non-Thinking Mode**，而非依赖 prompt 软性引导。
+It is a model with reasoning capabilities built into a single unified checkpoint: you switch between **Thinking Mode** and **Non-Thinking Mode** by explicitly setting parameters (such as `enable_thinking` or a similar `thinking` boolean field in the chat template) in the inference request (not referring to a specific inference server's API request), rather than relying on soft prompt guidance.
 
-- **Thinking Mode**：启用 extended chain-of-thought 推理，模型先输出较长的内部推理过程，再给出最终答案，适用于复杂逻辑推理、数学、编程等任务。
-- **Non-Thinking Mode**：跳过显式推理过程，直接生成响应，适用于高效的通用对话场景，延迟更低、成本更省。
+## Quick Reference
 
-两种模式共享同一套模型权重，无需切换到不同的checkpoint，这一设计与同系列的 Qwen3.6-35B-A3B（MoE架构）保持一致。
+| Property | Value |
+|------|------|
+| Parameters | 27B (dense, all activated at inference) |
+| Architecture | Transformer (not MoE, no expert routing) |
+| Multimodal | Joint image / video / text input |
+| Inference Frameworks | vLLM / Transformers / SGLang |
+| Deployment VRAM | ~132 GB (BF16, single H200) |
+| Model Weights | ~52 GB (15 safetensors shards) |
+| Thinking Toggle | Chat Template level (`enable_thinking`) |
+| MoE in Same Series | Qwen3.6-35B-A3B (MoE architecture, 35B total / 3B active) |
 
-**架构特点**：作为稠密模型（而非MoE），Qwen3.6-27B 在推理时激活全部参数（active parameters = total parameters），不涉及专家路由（expert routing）的复杂性，因此部署和serving相对简单，是希望在中等规模下获得旗舰级能力、同时避免MoE部署复杂度的开发者的实用选择。据官方介绍，其在主要coding基准上的表现超过了上一代规模远大于它的开源旗舰 Qwen3.5-397B-A17B（397B总参数/17B激活参数的MoE模型）——但这个对比需要谨慎解读，因为一个是稠密模型全量激活27B，另一个MoE模型每次推理只激活17B，直接拿"参数量"做横向比较容易产生误导。
+### Mode Comparison
 
-**实践注意事项**：
-- Thinking Mode 与 Non-Thinking Mode 通常需要配套不同的采样参数（如 temperature、top_p、top_k 等），混用会影响输出质量，这是实际部署中容易踩的坑。
-- 已有社区反馈指出，部分推理框架（如某些版本的 vLLM 插件）在两种模式间切换时存在兼容性问题，实际部署前建议先验证目标推理框架对该模型thinking开关的支持是否稳定。
-- 模型已在 Hugging Face / ModelScope 开源权重，同时通过 Alibaba Cloud Model Studio API 及 Qwen Studio 提供在线访问。
+| Mode | Behavior | Use Cases | Latency |
+|------|------|---------|------|
+| **Thinking Mode** | Outputs `<thinking>` reasoning process + final answer | Math, programming, complex reasoning | High (~11K reasoning tokens) |
+| **Non-Thinking Mode** | Skips reasoning, generates answer directly | General conversation, fast response | Low |
 
-## Documentation and Resources 
+Both modes **share the same model weights and inference code** -- no need to switch between different checkpoints.
 
-- [CoT](https://www.nvidia.cn/glossary/cot-prompting/)
+### Architecture Characteristics
 
+As a dense model (not MoE), Qwen3.6-27B activates all parameters during inference (active parameters = total parameters), without the complexity of expert routing. This makes deployment and serving relatively straightforward, a practical choice for developers who want flagship-level capability at a mid-range scale while avoiding MoE deployment complexity.
 
+According to the official introduction, it outperforms the previous generation's much larger open-source flagship Qwen3.5-397B-A17B (a MoE model with 397B total / 17B active parameters) on major coding benchmarks -- but this comparison should be read with caution: one is a dense model fully activating 27B, while the other MoE model only activates 17B per inference step. Directly comparing "parameter count" across architectures can be misleading.
 
-## 几个核心概念
+### Practical Considerations
 
-- CoT = 推理时的提示技巧，不需要专门训练
-- Reasoning Model = 模型能力，靠SFT+RL训练出来的
-- Thinking Mode = 把Reasoning Model能力包装成的一个可调用/可配置的产品功能
+- Thinking Mode and Non-Thinking Mode typically require different sampling parameters (temperature, top_p, top_k, etc.); mixing them degrades output quality
+- Some inference frameworks (such as certain versions of vLLM plugins) have compatibility issues when switching between the two modes; verify before deploying
+- Model weights are open-sourced on Hugging Face / ModelScope, and online access is also available via Alibaba Cloud Model Studio API and Qwen Studio
 
-Reasoning Model + Thinking ON → inference 时进行显式/扩展 reasoning。
-Reasoning Model + Thinking OFF → 不进行（或显著减少）这种显式 reasoning，直接生成答案。
+---
 
+## Core Concepts
 
-### CoT（Chain of Thought，思维链）
+Three progressive concepts -- understanding their relationship is key to understanding Thinking Mode:
 
-本质上是一种推理时的技巧，2022年的论文首次系统提出。核心做法很简单：不让模型直接吐出答案，而是引导它先写出中间推理步骤，再给最终答案。最早的实现方式甚至只是在提示词里加一句"let's think step by step"，或者给几个带推理过程的示例（few-shot CoT）。这不需要专门训练——只要基础模型足够大、能力足够强，这种能力就是"涌现"出来的，靠的是模型预训练时学到的知识和模式匹配能力，CoT只是把这些能力"引导"出来。
+| | **CoT** | **Reasoning Model** | **Thinking Mode** |
+|---|---------|---------------------|-------------------|
+| **Essence** | A prompting technique at inference time | Model capability (trained) | A functional toggle presented by the model or through an inference server API |
+| **Requires training?** | No, "emerges" in large models | Requires SFT + RL | No, relies on the underlying Reasoning Model |
+| **Who controls** | User (via prompt) | Model (autonomous reasoning) | Developer / User (via API parameters) |
+| **Typical usage** | `"let's think step by step"` | o1 / o3 / DeepSeek-R1 | `enable_thinking: true` |
 
-### Reasoning Model（推理模型）
-
-这是模型能力层面的东西，指像 OpenAI 的 o1/o3、DeepSeek-R1 这类专门针对"深度推理"训练过的模型。它们和"用CoT提示普通模型"的区别在于：这种长链推理能力是训练出来的，不是靠prompt诱导的。模型会自主学会探索、回溯、自我验证、纠错这些行为，而普通模型光靠prompt很难稳定做到这些。
-
-训练方式大致是：
-
-- 先有一个预训练好的基础模型
-- 有时先用人工或合成的高质量推理轨迹做监督微调（SFT）"冷启动"
-- 核心是用强化学习（如PPO、GRPO等），在有客观可验证答案的任务上训练——数学题、代码题、逻辑题这类"答案对错一目了然"的任务
-- 奖励信号通常只看最终答案是否正确，不监督中间推理的具体内容，让模型自己摸索出"怎么想"更容易得到正确答案
-
-训练数据主要就是这些可自动打分的题目：数学竞赛题、编程题（能跑测试用例判断对错）、逻辑推理题等，因为它们能提供干净的奖励信号，适合大规模RL训练。
-
-
-Deep Reasoning 模型的训练数据，核心不是单纯收集大量人工编写的长 CoT，而是由高质量推理题目、可验证的答案以及模型生成的探索轨迹组成。训练通常先用人工或高质量合成的“问题→推理过程→答案”数据进行 SFT 冷启动，然后通过数学、代码、逻辑等具有明确正确答案的任务进行大规模强化学习，让模型自己探索不同解题路径，并通过最终答案或 verifier 给予奖励。经过反复训练，模型逐渐学会探索、回溯、自我验证和纠错等推理行为，而不是仅仅依赖 prompt 强制生成 CoT。
-
-
-### Thinking Mode / Extended Thinking（思考模式）
-
-这通常是产品/API层面的功能开关，是"Reasoning Model能力"的一种具体呈现形式：模型在给出最终回答前，会先生成一段可见（或可选择隐藏）的"思考"内容，通常还能调节思考的token预算（想得更久/更浅）。这既依赖底层模型本身具备推理能力（训练出来的），也是一个开发者/用户可以主动调用、配置的接口层功能。
-
-## vLLM 
-
-vLLM 的推理核心可以概括为：Scheduler 负责决定哪些请求、哪些 token 需要计算；KV Cache Manager 负责以 block 的方式管理和分配 KV Cache；Model Runner 调用模型的 forward()；Attention 从 KV Cache 中读取历史 K/V，并将新生成的 K/V 写回 Cache，最后通过 sampling 生成下一个 token。 在 TP=8 场景下，KV Cache 会分布在多个 GPU 上；而像 MooncakeConnector 这样的组件，则可以介入 KV Cache 层，将 Prefill 产生的 KV Cache 在不同 worker/GPU 之间通过 RDMA 等方式传输。因此，理解 vLLM 的 KV Cache，重点是沿着 Scheduler → KV Cache Manager → Model Runner → forward() → Attention → KV Cache → Connector 这条链路来看。
-
-
-如果新模型只是参数规模、层数、hidden size、vocab size 等发生变化，但 model architecture 和 KV Cache / Attention 机制不变，那么 vLLM 的整体推理框架通常不需要重新设计：
 ```
-Scheduler → KV Cache Manager → Model Runner → forward() → Attention → KV Cache → Sampling
+CoT          = A prompting technique, no specialized training needed
+Reasoning    = A model capability, trained through SFT + RL
+Thinking     = Packaging the Reasoning capability as an invokable product feature
 ```
-已有的模型 implementation 也通常可以复用，只需要根据新的模型配置加载不同参数即可。
 
-只有当新模型引入了新的 Attention、KV/State Cache、MoE、Vision Encoder、MTP 等架构或执行机制时，才可能需要修改相应的 model forward()、Attention/KV Cache 或其他 runtime 部分。
+### CoT (Chain of Thought)
 
+Essentially a technique at inference time, first systematically proposed in a 2022 paper. The core idea is simple: do not let the model spit out the answer directly, but guide it to first write out intermediate reasoning steps before giving the final answer. The earliest implementation was as simple as adding "let's think step by step" to the prompt, or providing a few examples with reasoning processes (few-shot CoT).
 
-如果 Qwen3.8-27B 引入全新的模型架构，为了让其在主流生态中正常运行，通常需要分别适配 Hugging Face Transformers、vLLM 和 SGLang。
+This does not require specialized training -- as long as the base model is large enough and capable enough, this ability "emerges." It relies on the knowledge and pattern-matching capabilities learned during pretraining; CoT simply "guides" these capabilities out.
 
-Transformers 需要提供标准的模型、配置、Processor 和 forward() 实现；vLLM 和 SGLang 则需要进一步针对各自的 inference runtime 适配模型执行、Attention、KV/State Cache、Tensor Parallel 等机制，以实现高性能推理。
+### Reasoning Model
 
-具体代码不一定全部由阿里维护，也可以由 Qwen、框架团队和社区共同完成。
+This is about model-level capability, referring to models like OpenAI's o1/o3 and DeepSeek-R1 that are specifically trained for "deep reasoning." The difference from "using CoT to prompt an ordinary model" is that this long-chain reasoning capability is trained, not induced by prompts. The model autonomously learns behaviors such as exploration, backtracking, self-verification, and error correction -- things an ordinary model struggles to do consistently with prompts alone.
 
+**Training Pipeline:**
 
-## Environment
+1. Start with a pretrained base model
+2. Use human-annotated or high-quality synthetic "question -> reasoning process -> answer" data for SFT cold start
+3. Core training uses reinforcement learning (PPO, GRPO, etc.) on tasks with objectively verifiable answers -- math problems, coding tasks, logic puzzles where "right or wrong is immediately clear"
+4. The reward signal typically only checks whether the final answer is correct, without supervising the specific content of intermediate reasoning, letting the model figure out "how to think" to more easily arrive at the correct answer
+
+The training data is primarily auto-scored problems: math competition problems, programming problems (where test cases determine correctness), logic puzzles, etc., because they provide clean reward signals suitable for large-scale RL training.
+
+### Thinking Mode / Extended Thinking
+
+This is the concrete presentation of "Reasoning Model capability": before giving the final answer, the model first generates a segment of "thinking" content (visible or optionally hidden), and often with an adjustable token budget for the thinking. This relies on both the underlying reasoning capability (trained) and is also an interface-level feature that developers / users can actively invoke and configure. See the "Thinking Mode Mechanism Verification" section below for details.
+
+---
+
+## Thinking Mode Mechanism Verification
+
+### Core Conclusion
+
+Thinking Mode is a toggle at the **Chat Template level** -- it is not a switch of model weights or inference code. The same 27B weights, the same `model.generate()` call; the behavioral difference comes entirely from **differences in the input token sequence**.
+
+### Experimental Method
+
+`qwen/low-automodel-thinking-prompt-diff.py` takes the same message `"What is 2+2?"` and runs it through `apply_chat_template()` with `enable_thinking=False` and `enable_thinking=True`, then decodes and compares the token sequences:
+
+```python
+# OFF: template directly closes the thinking tag
+inputs_off = processor.apply_chat_template(messages, ..., enable_thinking=False)
+text_off = processor.decode(inputs_off["input_ids"][0])
+
+# ON: template only opens the thinking tag, waits for the model to fill in reasoning
+inputs_on = processor.apply_chat_template(messages, ..., enable_thinking=True)
+text_on = processor.decode(inputs_on["input_ids"][0])
+```
+
+### Experimental Results
+
+```
+=== Non-Thinking Mode (token count: 19) ===
+'<|im_start|>user\nWhat is 2+2?\n<|im_end|>\n<|im_start|>assistant\n<thinking>\n\n</thinking>\n\n<|im_end|>\n'
+
+=== Thinking Mode (token count: 17) ===
+'<|im_start|>user\nWhat is 2+2?\n<|im_end|>\n<|im_start|>assistant\n<thinking>\n'
+```
+
+**The only difference**: the Non-Thinking template adds a pair of `\n</thinking>\n` after `<thinking>\n` (the template closes the thinking tag on the model's behalf), while the Thinking template only outputs `\n` (leaving the tag open, waiting for the model to fill in the reasoning content and close it).
+
+### Mechanism Diagram
+
+```
+enable_thinking=True  (Thinking Mode)
+  Template outputs:  ...<|im_start|>assistant\n<thinking>\n
+  Model sees open tag -> writes reasoning process -> writes </thinking> -> writes final answer
+
+enable_thinking=False (Non-Thinking Mode)
+  Template outputs:  ...<|im_start|>assistant\n<thinking>\n</thinking>\n\n
+  Model sees closed tag -> skips reasoning -> writes final answer directly
+```
+
+### Key Comparison
+
+| Dimension | Changes? |
+|------|---------|
+| Model weights | No -- same 27B set |
+| Inference code | No -- `forward()` is identical, no `if thinking_mode` |
+| `model.generate()` call | No -- parameters are identical |
+| Tokens injected by Chat Template | Yes -- ON has one fewer pair of closing tags |
+| input_ids the model sees | Yes -- 17 vs 19 tokens |
+| Sampling parameters (temperature, etc.) | Warning -- official docs recommend different values per mode |
+
+Both modes follow the **exact same computation graph**:
+
+```
+Thinking ON  input_ids -+
+                        +---> token_embed() -> forward() layer 0~63 -> lm_head() -> sample
+Thinking OFF input_ids -+
+                        (weights, code, path all identical; only variable is those 2-3 tokens)
+```
+
+### Why This Design
+
+- **Simplicity**: No need to maintain two sets of weights or two checkpoints
+- **Flexibility**: Same deployment, switch on demand at the API level
+- **Efficiency**: Non-Thinking mode skips the reasoning process, lower latency, fewer tokens consumed
+- **Unified**: The model's reasoning capability is trained (SFT + RL); the template just guides whether it "should think"
+
+### Full Call Chain
+
+From client API request to model output, the `enable_thinking` parameter passes through three layers:
+
+```
++--------------------------------------------------------------------+
+|                        Client (API Request)                         |
+|                                                                      |
+|  POST /v1/chat/completions                                           |
+|  {                                                                   |
+|    "messages": [...],                                                |
+|    "extra_body": {                                                   |
+|      "chat_template_kwargs": {                                       |
+|        "enable_thinking": true      <-- client specifies thinking    |
+|      }                                                               |
+|    }                                                                 |
+|  }                                                                   |
++-----------------------------------------------------------------------+
+|
+v
++--------------------------------------------------------------------+
+|                      vLLM Inference Server                          |
+|                                                                      |
+|  1. Parse API request, extract chat_template_kwargs                 |
+|  2. Call Chat Template to serialize messages                        |
+|     apply_chat_template(messages, enable_thinking=true)             |
+|  3. Template injects <thinking> tag into the prompt                 |
+|     -> generates input_ids (containing thinking guidance tokens)    |
+|  4. Feed token sequence into model inference                        |
+|     model.generate(input_ids, ...) <-- model is unaware of "API"    |
+|                                                                      |
++-----------------------------------------------------------------------+
+|
+v
++--------------------------------------------------------------------+
+|                        Model (27B Weights)                          |
+|                                                                      |
+|  Sees open <thinking> tag -> begins reasoning                        |
+|  Generates: <thinking>reasoning</thinking> + final answer            |
+|                                                                      |
++--------------------------------------------------------------------+
+```
+
+**Three-layer meaning:**
+
+| Layer | Parameter | Controlled By | Role |
+|------|------|--------|------|
+| **API Layer** | `extra_body.chat_template_kwargs.enable_thinking` | Client specifies in request | Tells server "this request needs thinking" |
+| **Template Layer** | Chat Template injects `<thinking>` tag | Server internal, template serialization phase | Translates thinking instruction into tokens the model understands |
+| **Model Layer** | Input token sequence (a few more/fewer tokens) | Entirely determined by template | Sees open tag -> reasons; sees closed tag -> skips |
+
+API parameter -> controls Chat Template -> changes the token sequence the model sees. The vLLM server is the middle layer (request -> template -> serialization -> inference -> return); weights and inference code never change, only those 2-3 tokens change. Regardless of which inference server or API format is used, it all converges to an `input_ids` tensor fed into the model.
+
+### API Support vs Model Support
+
+These are two **independent dimensions**:
+
+| | **Model Supports** (has reasoning training) | **Model Does Not Support** (no reasoning training) |
+|---|---|---|
+| **API supports thinking** | Normal operation (e.g. Qwen3.6-27B + vLLM) | Warning -- template injects tokens, but model was not trained for reasoning; poor output quality |
+| **API does not support thinking** | Warning -- model has capability but cannot activate via API; can manually construct tokens as a workaround | Neither works |
+
+- **Model Support** = reasoning capability is **trained** (SFT + RL)
+- **API Support** = the inference server provides a **parameter entry point**, translating client requests into correct token sequences
+
+Qwen3.6-27B's situation: **Model has capability + vLLM has parameter entry + Chat Template knows how to inject** -- all three are required. Without API support, you can still manually construct tokens; without model training, it simply does not work.
+
+### Usage Across Different Clients
+
+| Scenario | How to Pass |
+|------|---------|
+| **OpenAI-compatible API** (curl / SDK) | `extra_body: {"chat_template_kwargs": {"enable_thinking": true}}` |
+| **Transformers** (Python direct call) | `processor.apply_chat_template(..., enable_thinking=True)` |
+| **vLLM Native** | `--enable-auto-tool-choice --reasoning-parser qwen3` |
+| **Claude Code** (self-hosted) | `ANTHROPIC_MODEL` pointing to vLLM, with vLLM handling the template |
+
+When using the Transformers library directly, there is no "API support or not" issue -- you are the API layer, the `input_ids` returned by `apply_chat_template()` goes directly into `model.generate()`, fully transparent. This is the approach used by `qwen/low-automodel.py` and `qwen/low-automodel-thinking-prompt-diff.py`.
+
+---
+
+## Environment Setup
+
+### Hardware and Software Quick Reference
+
+| Component | Host (Bare Metal) | Dev Container |
+|------|---------------|---------------|
+| GPU | NVIDIA H100 80GB HBM3 | NVIDIA H100 80GB HBM3 |
+| Driver | NVIDIA 580.173.02 | NVIDIA 580.173.02 |
+| CUDA | 13.1 (host) / 13.0 (container) | 13.0 |
+| NCCL | Available | (2, 30, 7) |
+| Docker | 29.1.3 | -- |
+| containerd | 2.2.1 | -- |
+| nvidia-container-toolkit | 1.19.1 | -- |
+| Python | -- | 3.12.3 |
+| PyTorch | -- | 2.14.0+cu130 |
+| Transformers | -- | 5.16.1 |
 
 ### Host
 
-``` bash
+```bash
+# GPU status
+nvidia-smi
+# GPU: NVIDIA H100 80GB HBM3, 0 MiB / 81559 MiB
 
-# nvidia-smi
-Sun Sep  6 18:27:26 2026       
-+-----------------------------------------------------------------------------------------+
-| NVIDIA-SMI 580.173.02             Driver Version: 580.173.02     CUDA Version: 13.0     |
-+-----------------------------------------+------------------------+----------------------+
-| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
-| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
-|                                         |                        |               MIG M. |
-|=========================================+========================+======================|
-|   0  NVIDIA H100 80GB HBM3          On  |   00000000:00:09.0 Off |                    0 |
-| N/A   39C    P0             74W /  700W |       0MiB /  81559MiB |      0%      Default |
-|                                         |                        |             Disabled |
-+-----------------------------------------+------------------------+----------------------+
+# CUDA compiler
+nvcc --version
+# CUDA 13.1, V13.1.115
 
-+-----------------------------------------------------------------------------------------+
-| Processes:                                                                              |
-|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
-|        ID   ID                                                               Usage      |
-|=========================================================================================|
-|  No running processes found                                                             |
-+-----------------------------------------------------------------------------------------+
+# NVIDIA Container Toolkit
+nvidia-ctk --version
+# 1.19.1
 
-# nvcc --version
-nvcc: NVIDIA (R) Cuda compiler driver
-Copyright (c) 2005-2025 NVIDIA Corporation
-Built on Tue_Dec_16_07:23:41_PM_PST_2025
-Cuda compilation tools, release 13.1, V13.1.115
-Build cuda_13.1.r13.1/compiler.37061995_0
+# Docker
+docker version
+# Client/Server: 29.1.3, API 1.52
+# containerd: 2.2.1, runc: 1.3.4
 
-# dpkg -l | grep -i nvidia-container-toolkit
-ii  nvidia-container-toolkit         1.19.1-1                                         amd64        NVIDIA Container toolkit
-ii  nvidia-container-toolkit-base    1.19.1-1                                         amd64        NVIDIA Container Toolkit Base
-
-# apt list --installed 2>/dev/null | grep -i nvidia-container
-libnvidia-container-tools/unknown,now 1.19.1-1 amd64 [installed,upgradable to: 1.20.0-1]
-libnvidia-container1/unknown,now 1.19.1-1 amd64 [installed,upgradable to: 1.20.0-1]
-nvidia-container-toolkit-base/unknown,now 1.19.1-1 amd64 [installed,upgradable to: 1.20.0-1]
-nvidia-container-toolkit/unknown,now 1.19.1-1 amd64 [installed,upgradable to: 1.20.0-1]
-
-# which nvidia-ctk
-/usr/bin/nvidia-ctk
-
-# nvidia-ctk --version
-NVIDIA Container Toolkit CLI version 1.19.1
-commit: 09ceee5dde66ba9ce25c7cc69b1ebd5e6e3266fa
- 
-# docker info | grep -i runtime
- Runtimes: io.containerd.runc.v2 runc
- Default Runtime: runc
-
-# docker version
-Client:
- Version:           29.1.3
- API version:       1.52
- Go version:        go1.24.4
- Git commit:        29.1.3-0ubuntu3~22.04.2
- Built:             Wed Apr 29 22:18:59 2026
- OS/Arch:           linux/amd64
- Context:           default
-
-Server:
- Engine:
-  Version:          29.1.3
-  API version:      1.52 (minimum version 1.44)
-  Go version:       go1.24.4
-  Git commit:       29.1.3-0ubuntu3~22.04.2
-  Built:            Wed Apr 29 22:18:59 2026
-  OS/Arch:          linux/amd64
-  Experimental:     false
- containerd:
-  Version:          2.2.1
-  GitCommit:        
- runc:
-  Version:          1.3.4-0ubuntu1~22.04.1
-  GitCommit:        
- docker-init:
-  Version:          0.19.0
-  GitCommit:   
-
-# docker pull pytorch/pytorch:2.14.0-cuda13.0-cudnn9-devel
-
-# docker image ls
-IMAGE                                          ID             DISK USAGE   CONTENT SIZE   EXTRA
-pytorch/pytorch:2.14.0-cuda13.0-cudnn9-devel   cce09744eb86       36.3GB         13.4GB        
-
+# Pull PyTorch image
+docker pull pytorch/pytorch:2.14.0-cuda13.0-cudnn9-devel
+# Image size: 36.3 GB (content 13.4 GB)
 ```
 
-### Deploy a Dev Contianer
+### Deploy Dev Container
 
-``` bash
+```bash
 docker run --rm -d \
   --name dev-server \
   --gpus all \
@@ -183,103 +287,140 @@ docker run --rm -d \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --entrypoint /bin/bash \
   pytorch/pytorch:2.14.0-cuda13.0-cudnn9-devel \
-  -c '
-set -ex
-sleep infinity
-'
+  -c 'set -ex; sleep infinity'
 
-# docker logs -f dev-server
+# View logs
+docker logs -f dev-server
 
-# docker stop dev-server
+# Enter container
+docker exec -it dev-server /bin/bash
 ```
 
-``` bash
-# docker exec -it dev-server /bin/bash
+Install VS Code CLI inside the container and start a tunnel:
 
-root@3f20a4f1c3ba:/workspace# apt update 
-root@3f20a4f1c3ba:/workspace# apt install curl
+```bash
+# Inside container
+apt update && apt install curl
 
-root@3f20a4f1c3ba:/workspace# curl -Lk 'https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-x64' -o vscode_cli.tar.gz && \
-  tar -xf vscode_cli.tar.gz && \
-  mv code /usr/local/bin/code && \
-  rm vscode_cli.tar.gz
+# Install VS Code CLI
+curl -Lk 'https://code.visualstudio.com/sha/download?build=stable&os=cli-alpine-x64' \
+  -o vscode_cli.tar.gz && tar -xf vscode_cli.tar.gz && \
+  mv code /usr/local/bin/code && rm vscode_cli.tar.gz
 
-# Authenticate the tunnel with your GitHub account using the provided sign-in URL.
-root@3f20a4f1c3ba:/workspace# code tunnel user login --provider github
+# GitHub authentication
+code tunnel user login --provider github
 
-# Start the VS Code tunnel (ID: 001) in the background
-root@3f20a4f1c3ba:/workspace# nohup code tunnel --accept-server-license-terms --name 001 &> output.log &
+# Start tunnel
+nohup code tunnel --accept-server-license-terms --name 001 &> output.log &
 ```
 
-### Dev Envrionment
+### Container Environment Verification
 
-``` bash
-root@3f20a4f1c3ba:/workspace# nvidia-smi
-Sun Sep  6 18:57:06 2026       
-+-----------------------------------------------------------------------------------------+
-| NVIDIA-SMI 580.173.02             Driver Version: 580.173.02     CUDA Version: 13.0     |
-+-----------------------------------------+------------------------+----------------------+
-| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
-| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
-|                                         |                        |               MIG M. |
-|=========================================+========================+======================|
-|   0  NVIDIA H100 80GB HBM3          On  |   00000000:00:09.0 Off |                    0 |
-| N/A   39C    P0             73W /  700W |       0MiB /  81559MiB |      0%      Default |
-|                                         |                        |             Disabled |
-+-----------------------------------------+------------------------+----------------------+
+```bash
+# GPU
+nvidia-smi
+# NVIDIA H100 80GB HBM3, 0 MiB / 81559 MiB
 
-+-----------------------------------------------------------------------------------------+
-| Processes:                                                                              |
-|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
-|        ID   ID                                                               Usage      |
-|=========================================================================================|
-|  No running processes found                                                             |
-+-----------------------------------------------------------------------------------------+
+# CUDA
+nvcc --version
+# CUDA 13.0, V13.0.88
 
-root@3f20a4f1c3ba:/workspace# nvcc --version
-nvcc: NVIDIA (R) Cuda compiler driver
-Copyright (c) 2005-2025 NVIDIA Corporation
-Built on Wed_Aug_20_01:58:59_PM_PDT_2025
-Cuda compilation tools, release 13.0, V13.0.88
-Build cuda_13.0.r13.0/compiler.36424714_0
+# PyTorch
+python3 -c "import torch; print(torch.__version__)"
+# 2.14.0+cu130
 
-root@3f20a4f1c3ba:/workspace# python3 -c "import torch; print(torch.cuda.is_available())"
-True
+python3 -c "import torch; print(torch.cuda.is_available())"
+# True
 
-root@3f20a4f1c3ba:/workspace# python3 -c "import torch; print(torch.__version__)"
-2.14.0+cu130
+python3 -c "import torch; print(torch.cuda.nccl.version())"
+# (2, 30, 7)
 
-root@3f20a4f1c3ba:/workspace# python3 -c "import torch; print(torch.distributed.is_nccl_available())"
-True
-
-root@3f20a4f1c3ba:/workspace# python3 -c "import torch; print(torch.cuda.nccl.version())"
-(2, 30, 7)
-
-root@3f20a4f1c3ba:/workspace# python3 --version
-Python 3.12.3
+# Python
+python3 --version
+# Python 3.12.3
 ```
 
 ### Hugging Face Transformers
 
-``` bash
+```bash
+# Install dependencies
+pip install -U transformers accelerate safetensors huggingface_hub --break-system-packages
 
-root@3f20a4f1c3ba:/workspace# pip install -U transformers accelerate safetensors huggingface_hub --break-system-packages
+# Verify
+python -c "import transformers; print(transformers.__version__)"
+# 5.16.1
 
-root@3f20a4f1c3ba:/workspace# python -c "import transformers; print(transformers.__version__)"
-5.16.1
-
-root@3f20a4f1c3ba:/workspace# python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.device_count())"
-2.14.0+cu130
-True
-1
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.device_count())"
+# 2.14.0+cu130, True, 1
 ```
 
-## Test
+---
+
+## vLLM
+
+### Inference Pipeline
+
+vLLM's inference core can be summarized as:
 
 ```
-root@3f20a4f1c3ba:/workspace# python qwen/low-pipeline.py
-
-root@3f20a4f1c3ba:/workspace# python qwen/low-automodel.py
-
-root@3f20a4f1c3ba:/workspace# python qwen/low-model-arch.py
+Scheduler -> KV Cache Manager -> Model Runner -> forward() -> Attention -> KV Cache -> Sampling
 ```
+
+- **Scheduler**: determines which requests and which tokens need computation
+- **KV Cache Manager**: manages and allocates KV Cache in blocks
+- **Model Runner**: calls the model's `forward()`
+- **Attention**: reads historical K/V from KV Cache, writes newly generated K/V back to Cache
+- **Sampling**: generates the next token
+
+In a TP=8 scenario, the KV Cache is distributed across multiple GPUs. Components like MooncakeConnector can intervene at the KV Cache layer, transferring Prefill-produced KV Cache between different workers/GPUs via RDMA and other methods.
+
+### Model Parameter Changes vs Architecture Changes
+
+If a new model only changes parameter scale, number of layers, hidden size, vocab size, etc., but the model architecture and KV Cache / Attention mechanism remain the same, vLLM's overall inference framework does not need to be redesigned. Existing model implementations are typically reusable -- just load different parameters.
+
+Only when a new model introduces new Attention mechanisms, KV/State Cache, MoE, Vision Encoder, MTP, or other architectural or execution mechanisms is it necessary to modify the corresponding model `forward()`, Attention/KV Cache, or other runtime components.
+
+### Framework Ecosystem Adaptation
+
+If the Qwen series introduces an entirely new model architecture, to make it work correctly in the mainstream ecosystem, you typically need to adapt:
+
+- **Hugging Face Transformers**: provide standard model, configuration, Processor, and `forward()` implementation
+- **vLLM / SGLang**: adapt model execution, Attention, KV/State Cache, Tensor Parallel, etc. for their respective inference runtimes to achieve high-performance inference
+
+The specific code does not necessarily have to be maintained by Alibaba; it can be jointly completed by the Qwen team, framework teams, and the community.
+
+---
+
+## Testing and Verification
+
+Run in the Dev Container:
+
+```bash
+# Lowest level: Pipeline API
+python qwen/low-pipeline.py
+
+# AutoModel + AutoProcessor (with Thinking toggle)
+python qwen/low-automodel.py
+
+# Model architecture exploration (config, layers, parameters, device distribution)
+python qwen/low-model-arch.py
+
+# Thinking Mode ON vs OFF -- Chat Template difference verification
+python qwen/low-automodel-thinking-prompt-diff.py
+```
+
+### Thinking Mode Verification
+
+`qwen/low-automodel-thinking-prompt-diff.py` confirms: the Thinking toggle is a **Chat Template behavior**, not a change in model weights or inference code. See the "Thinking Mode Mechanism Verification" section above for details.
+
+---
+
+## References
+
+- [CoT (Chain of Thought)](https://www.nvidia.cn/glossary/cot-prompting/)
+- [Qwen Official Blog](https://qwen.ai/blog?id=qwen3.6-27b)
+- [Hugging Face - Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B)
+- [Transformers Model Doc](https://huggingface.co/docs/transformers/model_doc/qwen3_5)
+- [Qwen Code](https://github.com/QwenLM/qwen-code)
+- [vLLM Recipe](https://recipes.vllm.ai/Qwen/Qwen3.6-27B)
+- [Deep Learning Technical Analysis (CN)](http://eadst.com/blog/325)

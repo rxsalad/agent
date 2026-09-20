@@ -1,40 +1,40 @@
-
 # Tool Calling
 
-Tool Calling 是大语言模型与外部工具进行交互的一种机制。 应用首先通过 API 向模型提供可用工具及其参数 Schema，模型根据用户请求判断是否需要调用某个工具，并生成结构化的 Tool Call，包括工具名称和参数；应用程序收到 Tool Call 后负责实际执行工具，并将执行结果作为 Tool Result 返回给模型，模型再基于结果继续推理并生成最终响应。因此，Tool Calling 本身主要解决的是 “模型如何声明需要调用什么工具以及传递什么参数”，而工具的实际执行、权限控制和与外部系统的通信通常由 Agent/应用负责。
+Tool Calling is a mechanism by which large language models interact with external tools.
+- Upon receiving a user request, the application/Agent first sends the user request to the model inference server via an API, along with the available tools and their parameter Schemas. 
+- The model in the inference server determines whether a tool needs to be invoked based on the user request, and generates a structured Tool Call (including the tool name and parameters). 
+- After the application/Agent receives the Tool Call, it is responsible for actually executing the tool, and submits the execution result as a Tool Result back to the model inference server via the API. 
+- The model continues reasoning based on the Tool Result and generates the final response. The inference server returns the response to the application/Agent, which ultimately presents it to the user. 
 
-Tool 在 API 层是独立字段。
+Therefore, Tool Calling itself primarily addresses **"how the model declares which tool it needs to invoke and what parameters to pass"**, while actual tool execution, access control, and communication with external systems are handled by the application/Agent.
 
-Tool Schema 通常不是直接放在 system 字段里。
+## The Role of Tool Schema in the API and Inference Pipeline
 
-Inference server 会通过 Chat Template 把 tools[] 序列化成模型实际看到的 token sequence。
-所以从模型/inference 的角度，Tool Schema 可以视为 Prompt/Context 的一部分。
+**API Layer**: The Tool Schema is sent to the model inference server as an independent `tools` array field in the API request.
 
-Coding Agent 通常有很多 Tools:
+**Token Layer**: The inference server uses the Chat Template to serialize `tools[]` into the token sequence that the model actually sees, typically located near the System Prompt. Thus, from the model's perspective, the Tool Schema is part of the Prompt/Context.
+
+**Caching Layer**: Each Model API Call by a Coding Agent usually carries the same Tool Schema. Because the Tool Schema remains unchanged across multiple rounds of requests, it is an ideal Static Prefix — enabling Prefix Caching / KV Cache on the inference server avoids redundant computation.
+
+Coding Agents typically have many Tools:
 ```
-~15–40 tools      常见
-~30–80 tools      复杂 Agent
-100+ tools        多 MCP / 企业级 Agent
+~15–40 tools      Common
+~30–80 tools      Complex Agent
+100+ tools        Multi-MCP / Enterprise Agent
 ```
 
-Tool 数量本身不是最重要的，Tool Schema 的 token 数量更重要。
+The number of tools itself is not the most important factor — the token count of the Tool Schema is what matters:
 ```
-50 tools × 平均 300 tokens ≈ 15K tokens
+50 tools × average 300 tokens ≈ 15K tokens
 ```
 
-每个 Model API Call 通常都会带当前 Tools, 所以从 API payload 看，Tool Schema 很可能每个 request 都会出现。
+## Documentation and Resources
 
-Tool Schema在多个 request 中保持不变，那么它实际上是一个非常好的 Static Prefix。因此 Prefix Caching 可以避免重复计算 Tool Schema。
+- [Introduction](https://zhuanlan.zhihu.com/p/1993366249963538339)
 
-Tool 在 API 层是独立的 tools[]；经过 Chat Template 后，Tool Schema 通常进入模型的 Prompt Token Sequence，往往位于 System Prompt 附近；Coding Agent 的每次 Model Call 通常都会携带这些 Tool Schema，但通过 Prefix/KV Cache 可以避免每次重新计算。
+## Experiment
 
-## Documentation and Resources 
-
-- [Introudction](https://zhuanlan.zhihu.com/p/1993366249963538339)
-
-## 实验
-
-环境：
+Environment:
 
 ``` bash
 # pip install "mcp[cli]" --break-system-packages
@@ -42,17 +42,19 @@ Tool 在 API 层是独立的 tools[]；经过 Chat Template 后，Tool Schema �
 # pip install -U python-dotenv --break-system-packages
 
 # pip install -U openai --break-system-packages
+
+# pip3 install httpx --break-system-packages
 ```
 
 ```
-python client/client-tool-calling.py
+python3 ~/work/agent/client/client-tool-calling.py
 ```
 
-## 交互过程
+## Complete Tool Calling Interaction Flow
 
-### Agent第一次API请求
+### First API Request from the Application/Agent
 
-Agent 向 vLLM Server 发送用户请求，同时提供可用的 Tool Schema。
+The Agent sends the user request to the vLLM Server, along with the available Tool Schema.
 
 ```
 {
@@ -84,21 +86,21 @@ Agent 向 vLLM Server 发送用户请求，同时提供可用的 Tool Schema。
 }
 ```
 
-其中：
+Where:
 
-messages：用户请求和对话历史。
-tools：可供模型调用的 Tool Schema，包括 Tool 名称、描述以及参数定义。
-tool_choice="auto"：允许模型自行决定是否调用 Tool。
+messages: The user request and conversation history.
+tools: The Tool Schema available for the model to invoke, including tool names, descriptions, and parameter definitions.
+tool_choice="auto": Allows the model to decide on its own whether to invoke a Tool.
 
-### vLLM Server 处理第一次请求
+### vLLM Server Processes the First Request
 
-vLLM Server 收到 API 请求后，根据模型对应的 Chat Template 构造 Prompt。
+Upon receiving the API request, the vLLM Server constructs the Prompt based on the Chat Template corresponding to the model.
 
-Tool Schema 会被 Chat Template 序列化到模型能够理解的 Prompt 中，通常属于 system/tool context 的一部分。
+The Tool Schema is serialized into a model-understandable Prompt by the Chat Template, typically as part of the system/tool context.
 
-模型根据用户请求和 Tool Schema 生成结果。如果模型判断需要调用 Tool，则生成相应的 Tool Call；如果不需要调用 Tool，则可以直接生成普通回答。
+Based on the user request and the Tool Schema, the model generates a result. If the model determines that a Tool should be invoked, it generates the corresponding Tool Call; if no tool invocation is needed, it can generate a regular response directly.
 
-例如模型生成一个 Tool Call：
+For example, the model generates a Tool Call:
 
 ```
 {
@@ -116,23 +118,17 @@ Tool Schema 会被 Chat Template 序列化到模型能够理解的 Prompt 中，
 }
 ```
 
-此时，qwen3_xml 不是模型生成 Tool Call 的组件，而是 vLLM 用来解析模型生成的 Tool Call 的 Parser。
+Note: `qwen3_xml` is not the component by which the model generates Tool Calls, but rather the Parser that vLLM uses to **parse** the Tool Call from the model's output. The model is responsible for generating Tool Call text in a format that conforms to XML; vLLM's Parser is responsible for parsing and converting it into an OpenAI-compatible `tool_calls` structure, which is then returned to the Agent.
 
-vLLM 将模型生成的 Tool Call 解析后，转换成 OpenAI-compatible tool_calls，然后返回给 Agent。
+### Application/Agent Executes the Tool
 
-### Agent 执行 Tool
+After receiving `tool_calls`, the Agent matches the tool name to a local tool implementation, and the Agent/Runtime actually executes the corresponding Python function, HTTP API, MCP Tool, or other external service.
 
+### Second API Request from the Application/Agent
 
-Agent 收到 tool_calls 后，根据其中的信息找到对应的实际 Tool.
+After the Tool execution completes, the Agent adds both the Tool Call and the Tool Result to the messages, and then initiates another API request to the vLLM Server.
 
-然后由 Agent/runtime 实际执行 Python 函数、HTTP API、MCP Tool 或其他外部 Tool。
-
-### Agent 第二次 API 请求
-
-Tool 执行完成后，Agent 将 Tool Call 和 Tool Result 都加入 messages，然后再次向 vLLM Server 发起 API 请求。
-
-Tool Schema 通常仍然需要随请求提供，因为这是 API 请求的一部分；而 messages 则携带了之前的 Tool Call 和 Tool Result。具体是否需要客户端在每次请求都重复 tools，取决于所使用的 API/Agent 框架，但 OpenAI-compatible 的典型调用方式是每次请求都提供。
-
+The Tool Schema is typically still provided with the request, because it is part of the API request; the messages carry the previous Tool Call and Tool Result. Whether the client needs to repeat tools on every request depends on the API/Agent framework in use, but the typical calling pattern for OpenAI-compatible APIs is to provide them on every request.
 
 ```
 {
@@ -182,6 +178,14 @@ Tool Schema 通常仍然需要随请求提供，因为这是 API 请求的一部
 }
 ```
 
-### vLLM Server 处理第二次请求
+### vLLM Server Processes the Second Request
 
-vLLM Server 再次根据更新后的 messages 和 Chat Template 构造 Prompt, vLLM 将模型生成的结果返回给 Agent。
+The vLLM Server constructs the Prompt again based on the updated messages and the Chat Template. The model generates the final natural language response based on the Tool Result, and vLLM returns this response to the Agent.
+
+```
+The current weather in San Francisco is partly cloudy with a temperature of 65°F.
+```
+
+### Application/Agent Returns the Final Result to the User
+
+After receiving the model-generated final response, the Agent presents it to the user, completing the entire Tool Calling flow.

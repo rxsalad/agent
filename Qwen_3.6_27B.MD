@@ -169,7 +169,7 @@ Sun Sep  6 17:52:44 2026
     ]
   }'
 
-# curl http://129.212.179.95:8000/v1/chat/completions \
+# curl http://***.***.***.***:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer **********" \
   -d '{
@@ -179,6 +179,6 @@ Sun Sep  6 17:52:44 2026
     ]
   }'
 
-# curl http://129.212.179.95:8000/v1/models \
+# curl http://***.***.***.***:8000/v1/models \
   -H "Authorization: Bearer **********"
 ```

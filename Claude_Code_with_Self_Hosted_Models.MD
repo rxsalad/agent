@@ -26,7 +26,7 @@
 # cat .claude.json | grep playwright
 # claude mcp remove -s user playwright
 
-export ANTHROPIC_BASE_URL="http://129.212.179.95:8000"
+export ANTHROPIC_BASE_URL="http://***.***.***.***:8000"
 export ANTHROPIC_AUTH_TOKEN="**********"
 export ANTHROPIC_MODEL="Qwen/Qwen3.6-27B"
 export ANTHROPIC_SMALL_FAST_MODEL="Qwen/Qwen3.6-27B"
@@ -52,7 +52,7 @@ export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT="1"
 # cat .claude.json | grep playwright
 # claude mcp remove -s user playwright
 
-$env:ANTHROPIC_BASE_URL="http://129.212.179.95:8000"
+$env:ANTHROPIC_BASE_URL="http://***.***.***.***:8000"
 $env:ANTHROPIC_AUTH_TOKEN="**********"
 $env:ANTHROPIC_MODEL="Qwen/Qwen3.6-27B"
 $env:ANTHROPIC_SMALL_FAST_MODEL="Qwen/Qwen3.6-27B"

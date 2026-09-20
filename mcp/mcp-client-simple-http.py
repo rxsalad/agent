@@ -1,13 +1,13 @@
 # mcp-client-simple-http.py
 #
-# 不依赖 MCP SDK，用纯 httpx + JSON 手写 MCP 协议
-# 全同步，零 async，方便理解 MCP 的本质
+# No MCP SDK dependency — handwritten MCP protocol using httpx + JSON.
+# Fully synchronous, zero async, for clarity on how MCP works under the hood.
 #
-# MCP 协议（HTTP 传输）= JSON-RPC 2.0 over HTTP POST
-# 只需要三个消息：
-#   1. initialize    — 握手
-#   2. tools/list    — 询问对方有哪些工具
-#   3. tools/call    — 调用工具
+# MCP protocol (HTTP transport) = JSON-RPC 2.0 over HTTP POST
+# Only three messages are needed:
+#   1. initialize    — handshake
+#   2. tools/list    — discover available tools
+#   3. tools/call    — invoke a tool
 
 
 import json
@@ -16,19 +16,19 @@ from openai import OpenAI
 
 
 # ============================================================
-# 第 0 步：MCP 协议工具函数
+# Step 0: MCP protocol helper functions
 #
-# MCP（HTTP）就是：POST 一行 JSON 到服务器，读一行 JSON 回来
+# MCP (HTTP) is simply: POST one JSON line to the server, read one JSON line back
 # ============================================================
 
-rpc_id = 0  # 每发一条请求，id +1
+rpc_id = 0  # Increment id for each request
 
 
 def mcp_send(client, path, method, params=None, headers=None, *, include_resp=False):
-    """发一条 JSON-RPC 请求给 MCP server（HTTP 传输）
+    """Send a JSON-RPC request to the MCP server (HTTP transport).
 
-    默认返回解析后的 JSON body。
-    当 include_resp=True 时，返回 (body, response)，方便读取 response headers。
+    Returns the parsed JSON body by default.
+    When include_resp=True, returns (body, response) for reading response headers.
     """
     global rpc_id
     rpc_id += 1
@@ -48,7 +48,7 @@ def mcp_send(client, path, method, params=None, headers=None, *, include_resp=Fa
 
 
 def mcp_notify(client, path, method, params=None, headers=None):
-    """发一条 JSON-RPC 通知（不带 id，不需要响应）"""
+    """Send a JSON-RPC notification (no id, no response expected)."""
     notification = {
         "jsonrpc": "2.0",
         "method": method,
@@ -61,7 +61,7 @@ def mcp_notify(client, path, method, params=None, headers=None):
 
 
 # ============================================================
-# 第 1 步：连接 MCP server（HTTP）
+# Step 1: Connect to the MCP server (HTTP)
 # ============================================================
 
 import httpx
@@ -69,20 +69,20 @@ import httpx
 MCP_URL = "http://127.0.0.1:8000"
 MCP_PATH = "/mcp"
 
-print(f"连接 MCP server {MCP_URL}{MCP_PATH} ...")
+print(f"Connecting to MCP server {MCP_URL}{MCP_PATH} ...")
 client = httpx.Client(base_url=MCP_URL)
 
-# 请求头：client 需要接受 JSON 和 SSE；server 返回 JSON
+# Headers: client accepts JSON and SSE; server returns JSON
 default_headers = {
     "Accept": "application/json, text/event-stream",
     "Content-Type": "application/json",
 }
 
 # ============================================================
-# 第 2 步：MCP 握手（initialize）
+# Step 2: MCP handshake (initialize)
 # ============================================================
 
-print("握手 initialize ...")
+print("Handshake (initialize) ...")
 body, raw_resp = mcp_send(client, MCP_PATH, "initialize", {
     "protocolVersion": "2024-11-05",
     "capabilities": {},
@@ -90,28 +90,28 @@ body, raw_resp = mcp_send(client, MCP_PATH, "initialize", {
 }, headers=default_headers, include_resp=True)
 print(f"  server: {body.get('result', {}).get('serverInfo', {})}")
 
-# 从响应 header 获取 session id（后续请求携带）
+# Extract session id from response headers (used in subsequent requests)
 session_id = raw_resp.headers.get("mcp-session-id")
 if session_id:
     default_headers["mcp-session-id"] = session_id
     print(f"  session-id: {session_id}")
 
-# 告知 server 握手完成
+# Notify server that handshake is complete
 mcp_notify(client, MCP_PATH, "notifications/initialized",
            headers=default_headers)
 
 # ============================================================
-# 第 3 步：获取工具列表
+# Step 3: List available tools
 # ============================================================
 
-print("获取工具列表 ...")
+print("Listing tools ...")
 resp = mcp_send(client, MCP_PATH, "tools/list",
                 headers=default_headers)
 mcp_tools = resp["result"]["tools"]
 for t in mcp_tools:
-    print(f"  工具: {t['name']} — {t['description']}")
+    print(f"  Tool: {t['name']} — {t['description']}")
 
-# 转为 OpenAI 格式
+# Convert to OpenAI-compatible format
 openai_tools = [{
     "type": "function",
     "function": {
@@ -123,7 +123,7 @@ openai_tools = [{
 
 
 # ============================================================
-# 第 4 步：启动 LLM 客户端
+# Step 4: Initialize the LLM client
 # ============================================================
 
 from dotenv import load_dotenv
@@ -134,18 +134,18 @@ MODEL = "Qwen/Qwen3.6-27B"
 
 
 # ============================================================
-# 第 5 步：Agent 循环
+# Step 5: Agent loop
 #
-#   发消息给 Qwen
-#     → Qwen 决定要不要调用工具
-#       → 要：通过 HTTP 调用 MCP server，把结果送回 Qwen，继续循环
-#       → 不要：输出最终答案，结束
+#   Send message to Qwen
+#     → Qwen decides whether to call a tool
+#       → Yes: call MCP server via HTTP, send result back to Qwen, loop again
+#       → No: output final answer, done
 # ============================================================
 
 messages = [{"role": "user", "content": "What's the weather like in San Francisco?"}]
 
 while True:
-    # --- 请求 Qwen ---
+    # --- Request Qwen ---
     response = llm_client.chat.completions.create(
         model=MODEL,
         messages=messages,
@@ -156,39 +156,39 @@ while True:
     )
     msg = response.choices[0].message
 
-    # --- Qwen 不需要工具，直接回答 ---
+    # --- No tool needed — Qwen answers directly ---
     if not msg.tool_calls:
-        print(f"\n最终答案: {msg.content}")
+        print(f"\nFinal answer: {msg.content}")
         break
 
-    # --- Qwen 请求调用工具 ---
+    # --- Qwen requests a tool call ---
     messages.append(msg)
 
     for tool_call in msg.tool_calls:
         name  = tool_call.function.name
         args  = json.loads(tool_call.function.arguments)
 
-        print(f"\n调用工具: {name}({args})")
+        print(f"\nCalling tool: {name}({args})")
 
-        # 通过 HTTP 调用 MCP 工具（POST JSON，读 JSON 回来）
+        # Invoke MCP tool via HTTP (POST JSON, read JSON back)
         resp = mcp_send(client, MCP_PATH, "tools/call", {
             "name": name,
             "arguments": args,
         }, headers=default_headers)
 
-        # 提取结果文本
+        # Extract result text
         result_text = resp["result"]["content"][0]["text"]
-        print(f"工具返回: {result_text}")
+        print(f"Tool result: {result_text}")
 
-        # 把结果送回 Qwen
+        # Send result back to Qwen
         messages.append({
             "role": "tool",
             "tool_call_id": tool_call.id,
             "content": result_text,
         })
 
-# 清理：如果有 session id，通知 server 关闭 session
+# Cleanup: if session id exists, notify server to close the session
 if session_id:
     client.delete(MCP_PATH, headers=default_headers)
 client.close()
-print("\n连接已关闭。")
+print("\nConnection closed.")

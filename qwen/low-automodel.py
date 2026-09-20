@@ -28,7 +28,7 @@ inputs = processor.apply_chat_template(
     tokenize=True,
     return_dict=True,
     return_tensors="pt",
-    #enable_thinking=False,  # Thinking disabled
+    enable_thinking=False,  # Set to True to enable Thinking Mode (outputs chain-of-thought)
 ).to(model.device)
 
 outputs = model.generate(

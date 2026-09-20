@@ -43,7 +43,7 @@ MODEL = "Qwen/Qwen3.6-27B"
 #     MCP Server
 # ============================================================
 
-# 定义要启动什么
+# Define what to launch
 server_params = StdioServerParameters(
     command="python3",
     args=["mcp-weather-server.py"],
@@ -143,7 +143,7 @@ async def main():
     # Start MCP server
     # ========================================================
   
-    # 启动子进程
+    # Launch subprocess
     async with stdio_client(server_params) as (
         read,
         write,

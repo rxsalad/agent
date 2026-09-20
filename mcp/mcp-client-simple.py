@@ -1,13 +1,13 @@
 # mcp-client-simple.py
 #
-# 不依赖 MCP SDK，用纯 subprocess + JSON 手写 MCP 协议
-# 全同步，零 async，方便理解 MCP 的本质
+# No MCP SDK dependency — handwritten MCP protocol using subprocess + JSON.
+# Fully synchronous, zero async, for clarity on how MCP works under the hood.
 #
-# MCP 协议 = JSON-RPC 2.0 over stdin/stdout
-# 只需要三个消息：
-#   1. initialize    — 握手
-#   2. tools/list    — 询问对方有哪些工具
-#   3. tools/call    — 调用工具
+# MCP protocol = JSON-RPC 2.0 over stdin/stdout
+# Only three messages are needed:
+#   1. initialize    — handshake
+#   2. tools/list    — discover available tools
+#   3. tools/call    — invoke a tool
 
 
 import json
@@ -17,16 +17,16 @@ from openai import OpenAI
 
 
 # ============================================================
-# 第 0 步：MCP 协议工具函数
+# Step 0: MCP protocol helper functions
 #
-# MCP 就是：往子进程 stdin 写一行 JSON，从 stdout 读一行 JSON
+# MCP is simply: write one line of JSON to stdin, read one line from stdout
 # ============================================================
 
-rpc_id = 0  # 每发一条请求，id +1
+rpc_id = 0  # Increment id for each request
 
 
 def mcp_send(conn, method, params=None):
-    """发一条 JSON-RPC 请求给 MCP server"""
+    """Send a JSON-RPC request to the MCP server."""
     global rpc_id
     rpc_id += 1
     request = {
@@ -41,22 +41,22 @@ def mcp_send(conn, method, params=None):
 
 
 # ============================================================
-# 第 1 步：启动 MCP server 子进程
+# Step 1: Launch the MCP server subprocess
 # ============================================================
 
-print("启动 MCP server ...")
+print("Starting MCP server ...")
 conn = subprocess.Popen(
-    ["python3", "/root/work/data/agent/mcp/mcp-weather-server.py"],
+    ["python3", "/home/ubuntu/work/agent/mcp/mcp-weather-server.py"],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     text=True,
 )
 
 # ============================================================
-# 第 2 步：MCP 握手（initialize）
+# Step 2: MCP handshake (initialize)
 # ============================================================
 
-print("握手 initialize ...")
+print("Handshake (initialize) ...")
 resp = mcp_send(conn, "initialize", {
     "protocolVersion": "2024-11-05",
     "capabilities": {},
@@ -64,21 +64,21 @@ resp = mcp_send(conn, "initialize", {
 })
 print(f"  server: {resp.get('result', {}).get('serverInfo', {})}")
 
-# 告知 server 握手完成
+# Notify server that handshake is complete
 conn.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
 conn.stdin.flush()
 
 # ============================================================
-# 第 3 步：获取工具列表
+# Step 3: List available tools
 # ============================================================
 
-print("获取工具列表 ...")
+print("Listing tools ...")
 resp = mcp_send(conn, "tools/list")
 mcp_tools = resp["result"]["tools"]
 for t in mcp_tools:
-    print(f"  工具: {t['name']} — {t['description']}")
+    print(f"  Tool: {t['name']} — {t['description']}")
 
-# 转为 OpenAI 格式
+# Convert to OpenAI-compatible format
 openai_tools = [{
     "type": "function",
     "function": {
@@ -90,7 +90,7 @@ openai_tools = [{
 
 
 # ============================================================
-# 第 4 步：启动 LLM 客户端
+# Step 4: Initialize the LLM client
 # ============================================================
 
 from dotenv import load_dotenv
@@ -101,18 +101,18 @@ MODEL = "Qwen/Qwen3.6-27B"
 
 
 # ============================================================
-# 第 5 步：Agent 循环
+# Step 5: Agent loop
 #
-#   发消息给 Qwen
-#     → Qwen 决定要不要调用工具
-#       → 要：通过 MCP 调用，把结果送回 Qwen，继续循环
-#       → 不要：输出最终答案，结束
+#   Send message to Qwen
+#     → Qwen decides whether to call a tool
+#       → Yes: call via MCP, send result back to Qwen, loop again
+#       → No: output final answer, done
 # ============================================================
 
 messages = [{"role": "user", "content": "What's the weather like in San Francisco?"}]
 
 while True:
-    # --- 请求 Qwen ---
+    # --- Request Qwen ---
     response = client.chat.completions.create(
         model=MODEL,
         messages=messages,
@@ -123,36 +123,36 @@ while True:
     )
     msg = response.choices[0].message
 
-    # --- Qwen 不需要工具，直接回答 ---
+    # --- No tool needed — Qwen answers directly ---
     if not msg.tool_calls:
-        print(f"\n最终答案: {msg.content}")
+        print(f"\nFinal answer: {msg.content}")
         break
 
-    # --- Qwen 请求调用工具 ---
+    # --- Qwen requests a tool call ---
     messages.append(msg)
 
     for tool_call in msg.tool_calls:
         name  = tool_call.function.name
         args  = json.loads(tool_call.function.arguments)
 
-        print(f"\n调用工具: {name}({args})")
+        print(f"\nCalling tool: {name}({args})")
 
-        # 通过 MCP 调用工具（就是一行 JSON 出去，一行 JSON 回来）
+        # Invoke via MCP (one JSON line out, one JSON line back)
         resp = mcp_send(conn, "tools/call", {
             "name": name,
             "arguments": args,
         })
 
-        # 提取结果文本
+        # Extract result text
         result_text = resp["result"]["content"][0]["text"]
-        print(f"工具返回: {result_text}")
+        print(f"Tool result: {result_text}")
 
-        # 把结果送回 Qwen
+        # Send result back to Qwen
         messages.append({
             "role": "tool",
             "tool_call_id": tool_call.id,
             "content": result_text,
         })
 
-# 清理
+# Cleanup
 conn.terminate()
