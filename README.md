@@ -1,4 +1,4 @@
-# Qwen3.6-27B Agent Exploration
+# Agent Exploration
 
 Hands-on exploration of the complete Agent stack, covering LLM inference, reasoning, orchestration, and standardized tool invocation, using Qwen3.6-27B and the Model Context Protocol (MCP).
 
